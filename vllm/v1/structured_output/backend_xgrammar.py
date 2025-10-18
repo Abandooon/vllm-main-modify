@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -20,13 +20,6 @@ from vllm.v1.structured_output.backend_types import (StructuredOutputBackend,
 from vllm.v1.structured_output.utils import (choice_as_grammar,
                                              convert_lark_to_ebnf,
                                              grammar_is_likely_lark)
-
-# 在现有 import 之后追加（保持原风格）
-try:
-    from vllm.v1.structured_output.audit_tracker import AuditEventType
-except Exception:
-    AuditEventType = None  # 审计可选，不影响主流程
-
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -44,8 +37,6 @@ class XgrammarBackend(StructuredOutputBackend):
             self.vllm_config.structured_outputs_config.disable_any_whitespace
 
         if isinstance(self.tokenizer, MistralTokenizer):
-            # NOTE: ideally, xgrammar should handle this accordingly.
-            # refer to https://github.com/mlc-ai/xgrammar/blob/d77c0a0173ef14779c918e3be7966ba852f7910f/python/xgrammar/tokenizer_info.py#L98
             try:
                 if self.tokenizer.is_tekken:
                     encoded_vocab = self.tokenizer._vocab
@@ -57,21 +48,18 @@ class XgrammarBackend(StructuredOutputBackend):
                         )
                     ]
                 stop_token_ids = None
-                if (hasattr(
-                        self.tokenizer,
-                        "eos_token_id",
-                ) and self.tokenizer.eos_token_id is not None):
+                if (hasattr(self.tokenizer, "eos_token_id") and
+                    self.tokenizer.eos_token_id is not None):
                     stop_token_ids = [self.tokenizer.eos_token_id]
             except AttributeError as e:
                 raise ValueError(
                     f"Cannot get the vocabulary of the tokenizer "
                     f"{type(self.tokenizer)}. The tokenizer should have a "
                     "get_vocab method.") from e
-            tokenizer_info = xgr.TokenizerInfo(  # type: ignore
+            tokenizer_info = xgr.TokenizerInfo(
                 encoded_vocab=encoded_vocab,
-                # NOTE: https://github.com/mlc-ai/xgrammar/blob/5e141f6ff1ca02bc31f9e512e68b61f2a8ae88e5/tests/python/test_tokenizer_info.py#L43 # noqa: E501
-                vocab_type=xgr.VocabType.RAW
-                if self.tokenizer.is_tekken else xgr.VocabType.BYTE_FALLBACK,
+                vocab_type=xgr.VocabType.RAW if self.tokenizer.is_tekken
+                           else xgr.VocabType.BYTE_FALLBACK,
                 vocab_size=self.vocab_size,
                 stop_token_ids=stop_token_ids,
                 add_prefix_space=True,
@@ -143,13 +131,6 @@ class XgrammarBackend(StructuredOutputBackend):
 
 @dataclass
 class XgrammarGrammar(StructuredOutputGrammar):
-    # NOTE: This would be a generic-enough class for
-    # supporting different backends, in the future.
-    # For now, just xgrammar.
-    #
-    # https://xgrammar.mlc.ai/docs/api/python/index.html#xgrammar.GrammarMatcher.find_jump_forward_string
-    # for jump-forward decoding
-
     vocab_size: int
     matcher: xgr.GrammarMatcher = field(hash=False)
     ctx: xgr.CompiledGrammar = field(hash=False)
@@ -158,19 +139,33 @@ class XgrammarGrammar(StructuredOutputGrammar):
                                       hash=False,
                                       init=False)
     _is_terminated: bool = field(default=False, repr=False, hash=False)
-    _termination_logged: bool = field(default=False, repr=False, hash=False)  # ✅ 新增
+    _termination_logged: bool = field(default=False, repr=False, hash=False)
+
+    def __post_init__(self):
+        """Initialize base class and audit support."""
+        super().__init__()
+        self._backend_name = "xgrammar"
+        # ✅ 统一：运行时检查，不再使用静态变量
+        try:
+            from vllm.v1.structured_output.audit_tracker import get_audit_tracker
+            self._audit_tracker = get_audit_tracker()
+        except ImportError:
+            self._audit_tracker = None
 
     def _get_current_state_id(self) -> str:
         """尽力获取可读的状态ID；若后端不暴露则回退到可追踪信息。"""
-        # 尝试调试接口（若 xgrammar 暴露）
         state_fn = getattr(self.matcher, "debug_state", None)
         if callable(state_fn):
             try:
                 return state_fn()
             except Exception:
                 pass
-        # 回退：基于已处理 token 数 + 终止标志
         return f"tokens={self.num_processed_tokens};terminated={self._is_terminated}"
+
+    def _is_audit_enabled(self) -> bool:
+        """✅ 统一的运行时检查方法"""
+        return (self._audit_tracker is not None and
+                self._audit_tracker.is_enabled())
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM."""
@@ -178,60 +173,76 @@ class XgrammarGrammar(StructuredOutputGrammar):
             return False
 
         # 延迟绑定审计上下文（首包/首次进来再绑定）
-        if self._request_id is None and self._audit_tracker and self._audit_tracker.is_enabled():
+        if self._request_id is None and self._is_audit_enabled():
             self.set_audit_context(request_id)
 
         current_state = self._get_current_state_id()
 
         for token in tokens:
             if not self.matcher.accept_token(token):
-                # 失败路径：记录 TOKEN_REJECT，并保持原有返回逻辑
-                if self._audit_tracker and self._audit_tracker.is_enabled():
-                    self._audit_tracker.record_token_acceptance(
-                        request_id=request_id,
-                        tokens=[token],
-                        accepted=False,
-                        current_state=current_state,
-                    )
+                # 失败路径：记录 TOKEN_REJECT
+                if self._is_audit_enabled():
+                    try:
+                        from vllm.v1.structured_output.audit_tracker import AuditEventType
+                        self._audit_tracker.record_token_acceptance(
+                            request_id=request_id,
+                            tokens=[token],
+                            accepted=False,
+                            current_state=current_state,
+                        )
+                    except Exception:
+                        pass
                 logger.error(
-                    "Failed to advance FSM for request %s for tokens %s. Please file an issue.",
+                    "Failed to advance FSM for request %s for tokens %s. "
+                    "Please file an issue.",
                     request_id, token
                 )
                 return False
 
-            # 成功路径：逐 token 状态迁移事件
+            # 成功路径：逐token状态迁移事件
             self.num_processed_tokens += 1
             new_state = self._get_current_state_id()
-            if self._audit_tracker and self._audit_tracker.is_enabled() and AuditEventType:
-                self._audit_tracker.record_event(
-                    request_id=request_id,
-                    event_type=AuditEventType.STATE_TRANSITION,
-                    previous_state_id=current_state,
-                    current_state_id=new_state,
-                    selected_token=token,
-                    metadata={"num_processed_tokens": self.num_processed_tokens},
-                )
+            if self._is_audit_enabled():
+                try:
+                    from vllm.v1.structured_output.audit_tracker import AuditEventType
+                    self._audit_tracker.record_event(
+                        request_id=request_id,
+                        event_type=AuditEventType.STATE_TRANSITION,
+                        previous_state_id=current_state,
+                        current_state_id=new_state,
+                        selected_token=token,
+                        metadata={"num_processed_tokens": self.num_processed_tokens},
+                    )
+                except Exception:
+                    pass
             current_state = new_state
 
         # 批量接受成功事件
         self._is_terminated = self.matcher.is_terminated()
-        if self._audit_tracker and self._audit_tracker.is_enabled():
-            self._audit_tracker.record_token_acceptance(
-                request_id=request_id,
-                tokens=tokens,
-                accepted=True,
-                current_state=current_state,
-            )
+        if self._is_audit_enabled():
+            try:
+                self._audit_tracker.record_token_acceptance(
+                    request_id=request_id,
+                    tokens=tokens,
+                    accepted=True,
+                    current_state=current_state,
+                )
+            except Exception:
+                pass
 
         # 若刚刚进入终止态，则打 TERMINATION 事件（一次性）
         if self._is_terminated and not self._termination_logged:
-            if self._audit_tracker and self._audit_tracker.is_enabled() and AuditEventType:
-                self._audit_tracker.record_event(
-                    request_id=request_id,
-                    event_type=AuditEventType.TERMINATION,
-                    current_state_id=self._get_current_state_id(),
-                    metadata={"total_tokens": self.num_processed_tokens},
-                )
+            if self._is_audit_enabled():
+                try:
+                    from vllm.v1.structured_output.audit_tracker import AuditEventType
+                    self._audit_tracker.record_event(
+                        request_id=request_id,
+                        event_type=AuditEventType.TERMINATION,
+                        current_state_id=self._get_current_state_id(),
+                        metadata={"total_tokens": self.num_processed_tokens},
+                    )
+                except Exception:
+                    pass
             self._termination_logged = True
 
         return True
@@ -249,7 +260,6 @@ class XgrammarGrammar(StructuredOutputGrammar):
             else:
                 break
         if len(accepted_tokens) > 0:
-            # Rollback the FSM to the initial state
             self.matcher.rollback(len(accepted_tokens))
         return accepted_tokens
 
@@ -259,36 +269,41 @@ class XgrammarGrammar(StructuredOutputGrammar):
         self.num_processed_tokens -= num_tokens
         self._is_terminated = self.matcher.is_terminated()
 
-        if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-            self._audit_tracker.record_rollback(
-                request_id=self._request_id,
-                num_tokens=num_tokens,
-                current_state=self._get_current_state_id(),
-            )
+        if self._is_audit_enabled() and self._request_id:
+            try:
+                self._audit_tracker.record_rollback(
+                    request_id=self._request_id,
+                    num_tokens=num_tokens,
+                    current_state=self._get_current_state_id(),
+                )
+            except Exception:
+                pass
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
-        # 原有逻辑
         self.matcher.fill_next_token_bitmask(bitmask[idx])
 
-        # 审计：记录允许 token 集（或计数）
-        if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-            self._audit_tracker.record_bitmask_update(
-                request_id=self._request_id,
-                bitmask=bitmask[idx],
-                current_state=self._get_current_state_id(),
-            )
+        if self._is_audit_enabled() and self._request_id:
+            try:
+                bitmask_copy = bitmask[idx].clone()
+                self._audit_tracker.record_bitmask_update(
+                    request_id=self._request_id,
+                    bitmask=bitmask_copy,
+                    current_state=self._get_current_state_id(),
+                )
+            except Exception:
+                pass
 
     def is_terminated(self) -> bool:
-        # 仅返回状态，但在 accept_tokens 里已处理首次进入终止态的打点
         return self._is_terminated
 
     def reset(self):
         self.num_processed_tokens = 0
         self.matcher.reset()
         self._is_terminated = False
-        self._termination_logged = False  # 避免复用旧标志
+        self._termination_logged = False
 
 
+# ... (保留原有的验证函数，不变)
 def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
     """Check if JSON schema contains features unsupported by xgrammar."""
 
@@ -296,27 +311,22 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
         if not isinstance(obj, dict):
             return False
 
-        # Check for numeric ranges
         if obj.get("type") in ("integer", "number") and ("multipleOf" in obj):
             return True
 
-        # Check for array unsupported keywords
         if obj.get("type") == "array" and any(
                 key in obj for key in ("uniqueItems", "contains",
                                        "minContains", "maxContains")):
             return True
 
-        # Unsupported keywords for strings
         if obj.get("type") == "string" and "format" in obj:
             return True
 
-        # Unsupported keywords for objects
         if obj.get("type") == "object" and any(
                 key in obj for key in ("minProperties", "maxProperties",
                                        "propertyNames", "patternProperties")):
             return True
 
-        # Recursively check all nested objects and arrays
         for value in obj.values():
             if isinstance(value, dict):
                 if check_object(value):
@@ -381,16 +391,13 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
 
     if so_params.grammar:
         if grammar_is_likely_lark(so_params.grammar):
-            # xgrammar supports EBNF grammars only
             try:
                 so_params.grammar = convert_lark_to_ebnf(so_params.grammar)
             except ValueError as e:
                 raise ValueError(
                     "Failed to convert the grammar from Lark to EBNF. ") from e
 
-        # Test parsing EBNF grammar, possibly already converted from Lark
         try:
-            # parse the grammar, but we aren't compiling it.
             xgr.Grammar.from_ebnf(so_params.grammar)
         except Exception as e:
             raise ValueError("Invalid grammar specification.") from e

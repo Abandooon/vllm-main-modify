@@ -1,12 +1,9 @@
-# SPDX-License-Identifier: Apache-2.0
-# 修改的 OutlinesGrammar 类，添加审计支持
+# backend_outlines.py - 移除静态AUDIT_ENABLED，添加_is_audit_enabled
 
 from __future__ import annotations
 
 import ast
-import importlib
 import json
-import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -22,15 +19,8 @@ from vllm.v1.structured_output.utils import (OutlinesVocabulary,
                                              get_outlines_cache,
                                              get_outlines_vocabulary)
 
-# Import audit tracker
-try:
-    from vllm.v1.structured_output.audit_tracker import (
-        get_audit_tracker, AuditEventType
-    )
-
-    AUDIT_ENABLED = True
-except ImportError:
-    AUDIT_ENABLED = False
+# ❌ 移除静态变量
+# AUDIT_ENABLED = False  # DELETE THIS LINE
 
 if TYPE_CHECKING:
     import outlines_core as oc
@@ -47,108 +37,109 @@ class OutlinesGrammarWithAudit(StructuredOutputGrammar):
 
     vocab_size: int
     guide: oc.Guide = field(hash=False)
-    num_processed_tokens: int = field(default_factory=lambda: 0,
-                                      repr=False,
-                                      hash=False,
-                                      init=False)
-
-    # outlines_core signals done on DFA accept; vLLM expects done after EOS.
-    # We delay the finished flag by one step so EOS can still be emitted.
-    _prev_finished: bool = field(default=False,
-                                 init=False,
-                                 repr=False,
-                                 hash=False)
+    num_processed_tokens: int = field(default=0, repr=False, hash=False, init=False)
+    _prev_finished: bool = field(default=False, init=False, repr=False, hash=False)
 
     def __post_init__(self):
-        """Initialize the grammar with audit support."""
-        super().__init__()  # Initialize base class audit support
+        """Initialize base class and audit support."""
+        super().__init__()
         self._backend_name = "outlines"
+        try:
+            from vllm.v1.structured_output.audit_tracker import get_audit_tracker
+            self._audit_tracker = get_audit_tracker()
+        except ImportError:
+            self._audit_tracker = None
+
+    def _is_audit_enabled(self) -> bool:
+        """✅ 统一的运行时检查方法"""
+        return (self._audit_tracker is not None and
+                self._audit_tracker.is_enabled())
 
     def _get_current_state_id(self) -> Optional[str]:
         """Get current state ID from the guide."""
         try:
-            # This is implementation-specific, might need adjustment
-            # based on actual outlines_core API
-            if hasattr(self.guide, 'state') or hasattr(self.guide, 'current_state'):
-                state = getattr(self.guide, 'state', None) or getattr(self.guide, 'current_state', None)
+            if hasattr(self.guide, 'state'):
+                state = self.guide.state
+                return str(state) if state is not None else None
+            elif hasattr(self.guide, 'current_state'):
+                state = self.guide.current_state
                 return str(state) if state is not None else None
         except:
             pass
-        return None
+        return f"tokens={self.num_processed_tokens}"
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
-        """
-        Accepts a list of tokens and advances the FSM with audit tracking.
+        """Accepts a list of tokens and advances the FSM with audit tracking."""
+        if self._request_id is None:
+            self._request_id = request_id
+            if self._is_audit_enabled():
+                self.set_audit_context(request_id)
 
-        Returns True if the FSM was advanced successfully.
-        Returns False if the FSM failed to advance.
-        """
-        # Set audit context if not already set
-        if self._request_id is None and AUDIT_ENABLED:
-            self.set_audit_context(request_id)
-
-        # Record current state before processing
         current_state = self._get_current_state_id()
 
-        # Perform actual token acceptance check
         if self.guide.accepts_tokens(tokens):
-            # Tokens are accepted, advance the FSM
             for t in tokens:
                 prev_state = current_state
                 self.guide.advance(t)
                 self.num_processed_tokens += 1
                 current_state = self._get_current_state_id()
 
-                # Record state transition for each token if auditing
-                if self._audit_tracker and self._audit_tracker.is_enabled():
-                    self._audit_tracker.record_event(
-                        request_id=request_id,
-                        event_type=AuditEventType.STATE_TRANSITION,
-                        previous_state_id=prev_state,
-                        current_state_id=current_state,
-                        selected_token=t,
-                        metadata={"num_processed_tokens": self.num_processed_tokens}
-                    )
+                if self._is_audit_enabled():
+                    try:
+                        from vllm.v1.structured_output.audit_tracker import AuditEventType
+                        self._audit_tracker.record_event(
+                            request_id=request_id,
+                            event_type=AuditEventType.STATE_TRANSITION,
+                            previous_state_id=prev_state,
+                            current_state_id=current_state,
+                            selected_token=t,
+                            metadata={"num_processed_tokens": self.num_processed_tokens}
+                        )
+                    except Exception:
+                        pass
 
-            # Record successful acceptance
-            if self._audit_tracker and self._audit_tracker.is_enabled():
-                self._audit_tracker.record_token_acceptance(
-                    request_id=request_id,
-                    tokens=tokens,
-                    accepted=True,
-                    current_state=current_state
-                )
+            if self._is_audit_enabled():
+                try:
+                    self._audit_tracker.record_token_acceptance(
+                        request_id=request_id,
+                        tokens=tokens,
+                        accepted=True,
+                        current_state=current_state
+                    )
+                except Exception:
+                    pass
 
             return True
         else:
-            # Tokens are rejected
-            if self._audit_tracker and self._audit_tracker.is_enabled():
-                self._audit_tracker.record_token_acceptance(
-                    request_id=request_id,
-                    tokens=tokens,
-                    accepted=False,
-                    current_state=current_state
-                )
+            if self._is_audit_enabled():
+                try:
+                    self._audit_tracker.record_token_acceptance(
+                        request_id=request_id,
+                        tokens=tokens,
+                        accepted=False,
+                        current_state=current_state
+                    )
+                except Exception:
+                    pass
 
             return False
 
     def rollback(self, num_tokens: int) -> None:
         """Rollback with audit tracking."""
         prev_state = self._get_current_state_id()
-
-        # Perform actual rollback
         self.guide.rollback_state(num_tokens)
         self.num_processed_tokens -= num_tokens
-
         current_state = self._get_current_state_id()
 
-        # Record rollback event
-        if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-            self._audit_tracker.record_rollback(
-                request_id=self._request_id,
-                num_tokens=num_tokens,
-                current_state=current_state
-            )
+        if self._is_audit_enabled() and self._request_id:
+            try:
+                self._audit_tracker.record_rollback(
+                    request_id=self._request_id,
+                    num_tokens=num_tokens,
+                    current_state=current_state
+                )
+            except Exception:
+                pass
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
         """Validate tokens with audit tracking."""
@@ -161,35 +152,39 @@ class OutlinesGrammarWithAudit(StructuredOutputGrammar):
                 accepted.pop()
                 break
 
-        # Record validation event
-        if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-            self._audit_tracker.record_event(
-                request_id=self._request_id,
-                event_type=AuditEventType.TOKEN_VALIDATE,
-                accepted_tokens=accepted,
-                rejected_tokens=tokens[len(accepted):] if len(accepted) < len(tokens) else None,
-                current_state_id=current_state,
-                metadata={"total_tokens_validated": len(tokens)}
-            )
+        if self._is_audit_enabled() and self._request_id:
+            try:
+                from vllm.v1.structured_output.audit_tracker import AuditEventType
+                self._audit_tracker.record_event(
+                    request_id=self._request_id,
+                    event_type=AuditEventType.TOKEN_VALIDATE,
+                    accepted_tokens=accepted,
+                    rejected_tokens=tokens[len(accepted):] if len(accepted) < len(tokens) else None,
+                    current_state_id=current_state,
+                    metadata={"total_tokens_validated": len(tokens)}
+                )
+            except Exception:
+                pass
 
         return accepted
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         """Fill bitmask with audit tracking."""
         current_state = self._get_current_state_id()
-
-        # Perform actual bitmask filling
         mask = bitmask[idx]
         self.guide.write_mask_into(mask.data_ptr(), mask.numel(),
                                    mask.element_size())
 
-        # Record bitmask update event
-        if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-            self._audit_tracker.record_bitmask_update(
-                request_id=self._request_id,
-                bitmask=mask,
-                current_state=current_state
-            )
+        if self._is_audit_enabled() and self._request_id:
+            try:
+                mask_copy = mask.clone()
+                self._audit_tracker.record_bitmask_update(
+                    request_id=self._request_id,
+                    bitmask=mask_copy,
+                    current_state=current_state
+                )
+            except Exception:
+                pass
 
     def is_terminated(self) -> bool:
         """Check termination with audit tracking."""
@@ -197,39 +192,34 @@ class OutlinesGrammarWithAudit(StructuredOutputGrammar):
         prev = self._prev_finished
         self._prev_finished = curr
 
-        # Record termination event when it happens
-        if prev and not self._previously_logged_termination:
-            if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-                self._audit_tracker.record_event(
-                    request_id=self._request_id,
-                    event_type=AuditEventType.TERMINATION,
-                    current_state_id=self._get_current_state_id(),
-                    metadata={"total_tokens": self.num_processed_tokens}
-                )
-                self._previously_logged_termination = True
+        if prev and not hasattr(self, '_termination_logged'):
+            self._termination_logged = True
+            if self._is_audit_enabled() and self._request_id:
+                try:
+                    from vllm.v1.structured_output.audit_tracker import AuditEventType
+                    self._audit_tracker.record_event(
+                        request_id=self._request_id,
+                        event_type=AuditEventType.TERMINATION,
+                        current_state_id=self._get_current_state_id(),
+                        metadata={"total_tokens": self.num_processed_tokens}
+                    )
+                except Exception:
+                    pass
 
         return prev
-
-    # 新（替换整个 __init__）
-    def __init__(self, vocab_size: int, guide):
-        # 父类只做自身初始化，不接收 vocab_size/guide
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.guide = guide
-        self.num_processed_tokens = 0
-        self._prev_finished = False
-        self._previously_logged_termination = False
 
     def reset(self):
         """Reset with audit support."""
         self.num_processed_tokens = 0
         self._prev_finished = False
-        self._previously_logged_termination = False
+        self._termination_logged = False
         self.guide.reset()
 
-        # Reset audit context
         if self._audit_tracker and self._request_id:
-            self._audit_tracker.cleanup_trail(self._request_id)
+            try:
+                self._audit_tracker.cleanup_trail(self._request_id)
+            except Exception:
+                pass
             self._request_id = None
 
 
@@ -238,7 +228,7 @@ class OutlinesBackendWithAudit(StructuredOutputBackend):
     """Outlines backend with audit support."""
 
     def __post_init__(self):
-        super().__post_init__()  # Initialize audit support
+        super().__post_init__()
         self.vocabulary = get_outlines_vocabulary(self.tokenizer)
         self.cache = get_outlines_cache()
 
@@ -274,17 +264,10 @@ class OutlinesBackendWithAudit(StructuredOutputBackend):
             self.vllm_config.speculative_config.num_speculative_tokens
             if self.vllm_config.speculative_config is not None else 0)
 
-        # Create grammar instance with audit support
         grammar = OutlinesGrammarWithAudit(
             vocab_size=self.vocab_size,
             guide=oc.Guide(index, max_rollback=max_rollback_tokens)
         )
-
-        # Log grammar compilation if audit is enabled
-        if self._audit_tracker and self._audit_tracker.is_enabled():
-            from vllm.logger import init_logger
-            logger = init_logger(__name__)
-            logger.debug(f"Compiled {request_type.name} grammar with audit support")
 
         return grammar
 

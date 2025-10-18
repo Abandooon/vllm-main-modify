@@ -107,83 +107,119 @@ class GuidanceGrammar(StructuredOutputGrammar):
     vocab_size: int
     printed_error: bool = False
     terminated: bool = False
-    num_processed_tokens: int = 0  # ✅ 新增：统一统计口径
+    num_processed_tokens: int = 0
     _termination_logged: bool = False
 
-def check_error(self):
+    def __post_init__(self):
+        """Initialize base class and audit support."""
+        super().__init__()
+        self._backend_name = "guidance"
+        # 初始化审计tracker
+        try:
+            from vllm.v1.structured_output.audit_tracker import get_audit_tracker
+            self._audit_tracker = get_audit_tracker()
+        except ImportError:
+            self._audit_tracker = None
+
+    def _is_audit_enabled(self) -> bool:
+        """✅ 统一的运行时检查方法"""
+        return (self._audit_tracker is not None and
+                self._audit_tracker.is_enabled())
+
+    def check_error(self):
         if not self.printed_error:
             err = self.ll_matcher.get_error()
             if err:
                 self.printed_error = True
                 logger.warning("LLMatcher error: %s", err)
 
+    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
+        """Accepts a list of tokens and advances the parser."""
+        # 延迟绑定审计上下文（首次进来时绑定）
+        if self._request_id is None:
+            self._request_id = request_id
+            # ✅ 修改1：使用统一方法
+            if self._is_audit_enabled():
+                try:
+                    self.set_audit_context(request_id)
+                except Exception:
+                    pass
 
-def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
-    """Accepts a list of tokens and advances the parser."""
-    if self.ll_tokenizer.eos_token in tokens:
-        self.terminated = True
+        if self.ll_tokenizer.eos_token in tokens:
+            self.terminated = True
 
-    if self.ll_matcher.is_stopped():
-        return True
+        if self.ll_matcher.is_stopped():
+            return True
 
-    # 延迟绑定审计上下文
-    if self._request_id is None and self._audit_tracker and self._audit_tracker.is_enabled():
-        self.set_audit_context(request_id)
+        # 记录当前状态
+        def _state_id() -> str:
+            return f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}"
 
-    # 记录当前状态（Guidance 没有显式状态机ID，用可追踪代替）
-    def _state_id() -> str:
-        return f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}"
+        prev_state = _state_id()
+        r = self.ll_matcher.consume_tokens(tokens)
+        self.check_error()
 
-    prev_state = _state_id()
-    r = self.ll_matcher.consume_tokens(tokens)
-    self.check_error()
+        if r:
+            # 逐token转移
+            for t in tokens:
+                self.num_processed_tokens += 1
+                # ✅ 修改2：使用统一方法（保留AuditEventType检查）
+                if self._is_audit_enabled() and AuditEventType:
+                    try:
+                        self._audit_tracker.record_event(
+                            request_id=request_id,
+                            event_type=AuditEventType.STATE_TRANSITION,
+                            previous_state_id=prev_state,
+                            current_state_id=_state_id(),
+                            selected_token=t,
+                            metadata={"num_processed_tokens": self.num_processed_tokens},
+                        )
+                    except Exception:
+                        pass
+                prev_state = _state_id()
 
-    if r:
-        # 逐 token 迁移（用步数近似状态演化）
-        for t in tokens:
-            self.num_processed_tokens += 1
-            if self._audit_tracker and self._audit_tracker.is_enabled() and AuditEventType:
-                self._audit_tracker.record_event(
-                    request_id=request_id,
-                    event_type=AuditEventType.STATE_TRANSITION,
-                    previous_state_id=prev_state,
-                    current_state_id=_state_id(),
-                    selected_token=t,
-                    metadata={"num_processed_tokens": self.num_processed_tokens},
-                )
-            prev_state = _state_id()
+            # ✅ 修改3：使用统一方法
+            if self._is_audit_enabled():
+                try:
+                    self._audit_tracker.record_token_acceptance(
+                        request_id=request_id,
+                        tokens=tokens,
+                        accepted=True,
+                        current_state=prev_state,
+                    )
+                except Exception:
+                    pass
+        else:
+            # ✅ 修改4：使用统一方法
+            if self._is_audit_enabled():
+                try:
+                    self._audit_tracker.record_token_acceptance(
+                        request_id=request_id,
+                        tokens=tokens,
+                        accepted=False,
+                        current_state=prev_state,
+                    )
+                except Exception:
+                    pass
 
-        if self._audit_tracker and self._audit_tracker.is_enabled():
-            self._audit_tracker.record_token_acceptance(
-                request_id=request_id,
-                tokens=tokens,
-                accepted=True,
-                current_state=prev_state,
-            )
-    else:
-        if self._audit_tracker and self._audit_tracker.is_enabled():
-            self._audit_tracker.record_token_acceptance(
-                request_id=request_id,
-                tokens=tokens,
-                accepted=False,
-                current_state=prev_state,
-            )
+        # 终止事件（一次性）
+        if (self.terminated or self.ll_matcher.is_stopped()) and not self._termination_logged:
+            # ✅ 修改5：使用统一方法（保留AuditEventType检查）
+            if self._is_audit_enabled() and AuditEventType:
+                try:
+                    self._audit_tracker.record_event(
+                        request_id=request_id,
+                        event_type=AuditEventType.TERMINATION,
+                        current_state_id=_state_id(),
+                        metadata={"total_tokens": self.num_processed_tokens},
+                    )
+                except Exception:
+                    pass
+            self._termination_logged = True
 
-    # 若已停或收到 EOS，触发一次性终止打点
-    if (self.terminated or self.ll_matcher.is_stopped()) and not self._termination_logged:
-        if self._audit_tracker and self._audit_tracker.is_enabled() and AuditEventType:
-            self._audit_tracker.record_event(
-                request_id=request_id,
-                event_type=AuditEventType.TERMINATION,
-                current_state_id=_state_id(),
-                metadata={"total_tokens": self.num_processed_tokens},
-            )
-        self._termination_logged = True
+        return r
 
-    return r
-
-
-def validate_tokens(self, tokens: list[int]) -> list[int]:
+    def validate_tokens(self, tokens: list[int]) -> list[int]:
         """Checks if the list of tokens are accepted by the parser in sequence.
         Will not advance the parser.
 
@@ -200,33 +236,32 @@ def validate_tokens(self, tokens: list[int]) -> list[int]:
 
         return tokens[:num_tokens]
 
+    def rollback(self, num_tokens: int) -> None:
+        prev_state_tokens = self.num_processed_tokens
+        self.ll_matcher.rollback(num_tokens)
+        self.check_error()
+        self.num_processed_tokens = max(0, prev_state_tokens - num_tokens)
 
-def rollback(self, num_tokens: int) -> None:
-    prev_state_tokens = self.num_processed_tokens
-    self.ll_matcher.rollback(num_tokens)
-    self.check_error()
-    self.num_processed_tokens = max(0, prev_state_tokens - num_tokens)
+        # ✅ 修改6：使用统一方法（保留self._request_id检查）
+        if self._is_audit_enabled() and self._request_id:
+            self._audit_tracker.record_rollback(
+                request_id=self._request_id,
+                num_tokens=num_tokens,
+                current_state=f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}",
+            )
 
-    if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-        self._audit_tracker.record_rollback(
-            request_id=self._request_id,
-            num_tokens=num_tokens,
-            current_state=f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}",
-        )
+    def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
+        # 原逻辑
+        llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)
+        self.check_error()
 
-
-def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
-    # 原逻辑
-    llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)
-    self.check_error()
-
-    # 审计：bitmask（允许 token 集/数量）
-    if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-        self._audit_tracker.record_bitmask_update(
-            request_id=self._request_id,
-            bitmask=bitmask[idx],
-            current_state=f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}",
-        )
+        # ✅ 修改7：使用统一方法（保留self._request_id检查）
+        if self._is_audit_enabled() and self._request_id:
+            self._audit_tracker.record_bitmask_update(
+                request_id=self._request_id,
+                bitmask=bitmask[idx],
+                current_state=f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}",
+            )
 
     def is_terminated(self) -> bool:
         return self.terminated

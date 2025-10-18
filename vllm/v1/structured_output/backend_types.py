@@ -31,14 +31,28 @@ class StructuredOutputOptions(enum.Enum):
 StructuredOutputKey = tuple[StructuredOutputOptions, str]
 
 
+# backend_types.py - 改进的基类
 class StructuredOutputGrammar(ABC):
-    """Request-level backend for structured output requests."""
-
     def __init__(self):
-        """Initialize the grammar with optional audit support."""
         self._audit_tracker: Optional[StructuredOutputAuditTracker] = None
         self._request_id: Optional[str] = None
         self._backend_name: str = self.__class__.__name__
+        self._previously_logged_termination: bool = False
+
+    # 改用factory method而不是直接在__init__中初始化
+    @classmethod
+    def create_with_audit(cls, *args, **kwargs):
+        """Factory method for creating grammar with audit support"""
+        instance = cls(*args, **kwargs)
+        instance._init_audit()  # 延迟调用审计初始化
+        return instance
+
+    def _init_audit(self):
+        try:
+            from vllm.v1.structured_output.audit_tracker import get_audit_tracker
+            self._audit_tracker = get_audit_tracker()
+        except ImportError:
+            pass
 
     def set_audit_context(self,
                           request_id: str,

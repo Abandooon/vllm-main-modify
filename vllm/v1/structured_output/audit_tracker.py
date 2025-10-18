@@ -47,6 +47,11 @@ class AuditEvent:
     step_number: int
     event_type: AuditEventType
     request_id: str
+    timestamp_ns: int = 0  # 纳秒精度
+
+    def __post_init__(self):
+        import time
+        self.timestamp_ns = time.time_ns()
 
     # State information
     current_state_id: Optional[str] = None
@@ -67,6 +72,7 @@ class AuditEvent:
         """Convert audit event to dictionary for JSON serialization."""
         result = {
             "timestamp": self.timestamp,
+            "timestamp_ns": self.timestamp_ns,
             "step_number": self.step_number,
             "event_type": self.event_type.value,
             "request_id": self.request_id,
@@ -208,9 +214,13 @@ class StructuredOutputAuditTracker:
             return
 
         with self._lock:
-            # Clean up old trails if needed
+            # 如果trail已存在，则不覆盖
+            if request_id in self._trails:
+                logger.debug(f"Trail for {request_id} already exists, skipping restart")
+                return
+
+            # 检查容量上限
             if len(self._trails) >= self.max_trails:
-                # Remove oldest trail
                 oldest_id = min(self._trails.keys(),
                                 key=lambda k: self._trails[k].start_time)
                 del self._trails[oldest_id]
@@ -281,9 +291,8 @@ class StructuredOutputAuditTracker:
         if not self.enabled:
             return
 
-        # 新
+        # 计算允许的token数量
         if isinstance(bitmask, torch.Tensor):
-            # 允许位为正值（1），0 视为不允许；对 bool 也可用 count_nonzero
             allowed_count = int(torch.count_nonzero(bitmask > 0).item())
         else:
             allowed_count = int(np.count_nonzero(bitmask > 0))
