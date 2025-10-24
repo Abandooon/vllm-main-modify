@@ -18,10 +18,6 @@ from vllm.v1.structured_output.backend_types import (StructuredOutputBackend,
                                                      StructuredOutputGrammar,
                                                      StructuredOutputOptions)
 from vllm.v1.structured_output.request import get_structured_output_key
-try:
-    from vllm.v1.structured_output.audit_tracker import AuditEventType
-except Exception:
-    AuditEventType = None
 
 if TYPE_CHECKING:
     import llguidance
@@ -41,7 +37,7 @@ def _walk_json_for_additional_properties(data: object):
         for value in data.values():
             _walk_json_for_additional_properties(value)
         if 'additionalProperties' not in data and \
-            ('properties' in data or 'patternProperties' in data):
+                ('properties' in data or 'patternProperties' in data):
             data['additionalProperties'] = False
     elif isinstance(data, list):
         for item in data:
@@ -63,6 +59,7 @@ def process_for_additional_properties(
 class GuidanceBackend(StructuredOutputBackend):
 
     def __post_init__(self):
+        super().__post_init__()
         self.disable_any_whitespace = \
             self.vllm_config.structured_outputs_config.disable_any_whitespace
         self.disable_additional_properties = \
@@ -108,13 +105,12 @@ class GuidanceGrammar(StructuredOutputGrammar):
     printed_error: bool = False
     terminated: bool = False
     num_processed_tokens: int = 0
-    _termination_logged: bool = False
 
     def __post_init__(self):
         """Initialize base class and audit support."""
         super().__init__()
         self._backend_name = "guidance"
-        # 初始化审计tracker
+        self._termination_logged = False
         try:
             from vllm.v1.structured_output.audit_tracker import get_audit_tracker
             self._audit_tracker = get_audit_tracker()
@@ -122,9 +118,13 @@ class GuidanceGrammar(StructuredOutputGrammar):
             self._audit_tracker = None
 
     def _is_audit_enabled(self) -> bool:
-        """✅ 统一的运行时检查方法"""
+        """统一的运行时检查方法"""
         return (self._audit_tracker is not None and
                 self._audit_tracker.is_enabled())
+
+    def _get_current_state_id(self) -> str:
+        """Get current state identifier."""
+        return f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}"
 
     def check_error(self):
         if not self.printed_error:
@@ -138,7 +138,6 @@ class GuidanceGrammar(StructuredOutputGrammar):
         # 延迟绑定审计上下文（首次进来时绑定）
         if self._request_id is None:
             self._request_id = request_id
-            # ✅ 修改1：使用统一方法
             if self._is_audit_enabled():
                 try:
                     self.set_audit_context(request_id)
@@ -151,11 +150,7 @@ class GuidanceGrammar(StructuredOutputGrammar):
         if self.ll_matcher.is_stopped():
             return True
 
-        # 记录当前状态
-        def _state_id() -> str:
-            return f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}"
-
-        prev_state = _state_id()
+        prev_state = self._get_current_state_id()
         r = self.ll_matcher.consume_tokens(tokens)
         self.check_error()
 
@@ -163,22 +158,24 @@ class GuidanceGrammar(StructuredOutputGrammar):
             # 逐token转移
             for t in tokens:
                 self.num_processed_tokens += 1
-                # ✅ 修改2：使用统一方法（保留AuditEventType检查）
-                if self._is_audit_enabled() and AuditEventType:
+                current_state = self._get_current_state_id()
+
+                if self._is_audit_enabled():
                     try:
+                        from vllm.v1.structured_output.audit_tracker import AuditEventType
                         self._audit_tracker.record_event(
                             request_id=request_id,
                             event_type=AuditEventType.STATE_TRANSITION,
                             previous_state_id=prev_state,
-                            current_state_id=_state_id(),
+                            current_state_id=current_state,
                             selected_token=t,
                             metadata={"num_processed_tokens": self.num_processed_tokens},
                         )
                     except Exception:
                         pass
-                prev_state = _state_id()
+                prev_state = current_state
 
-            # ✅ 修改3：使用统一方法
+            # 记录接受
             if self._is_audit_enabled():
                 try:
                     self._audit_tracker.record_token_acceptance(
@@ -190,7 +187,7 @@ class GuidanceGrammar(StructuredOutputGrammar):
                 except Exception:
                     pass
         else:
-            # ✅ 修改4：使用统一方法
+            # 记录拒绝
             if self._is_audit_enabled():
                 try:
                     self._audit_tracker.record_token_acceptance(
@@ -204,18 +201,18 @@ class GuidanceGrammar(StructuredOutputGrammar):
 
         # 终止事件（一次性）
         if (self.terminated or self.ll_matcher.is_stopped()) and not self._termination_logged:
-            # ✅ 修改5：使用统一方法（保留AuditEventType检查）
-            if self._is_audit_enabled() and AuditEventType:
+            self._termination_logged = True
+            if self._is_audit_enabled():
                 try:
+                    from vllm.v1.structured_output.audit_tracker import AuditEventType
                     self._audit_tracker.record_event(
                         request_id=request_id,
                         event_type=AuditEventType.TERMINATION,
-                        current_state_id=_state_id(),
+                        current_state_id=self._get_current_state_id(),
                         metadata={"total_tokens": self.num_processed_tokens},
                     )
                 except Exception:
                     pass
-            self._termination_logged = True
 
         return r
 
@@ -230,11 +227,27 @@ class GuidanceGrammar(StructuredOutputGrammar):
         if self.ll_matcher.is_stopped():
             return []
 
+        current_state = self._get_current_state_id()
         num_tokens = self.ll_matcher.validate_tokens(tokens)
-
         self.check_error()
 
-        return tokens[:num_tokens]
+        validated_tokens = tokens[:num_tokens]
+
+        if self._is_audit_enabled() and self._request_id:
+            try:
+                from vllm.v1.structured_output.audit_tracker import AuditEventType
+                self._audit_tracker.record_event(
+                    request_id=self._request_id,
+                    event_type=AuditEventType.TOKEN_VALIDATE,
+                    accepted_tokens=validated_tokens,
+                    rejected_tokens=tokens[num_tokens:] if num_tokens < len(tokens) else None,
+                    current_state_id=current_state,
+                    metadata={"total_tokens_validated": len(tokens)}
+                )
+            except Exception:
+                pass
+
+        return validated_tokens
 
     def rollback(self, num_tokens: int) -> None:
         prev_state_tokens = self.num_processed_tokens
@@ -242,45 +255,55 @@ class GuidanceGrammar(StructuredOutputGrammar):
         self.check_error()
         self.num_processed_tokens = max(0, prev_state_tokens - num_tokens)
 
-        # ✅ 修改6：使用统一方法（保留self._request_id检查）
         if self._is_audit_enabled() and self._request_id:
-            self._audit_tracker.record_rollback(
-                request_id=self._request_id,
-                num_tokens=num_tokens,
-                current_state=f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}",
-            )
+            try:
+                self._audit_tracker.record_rollback(
+                    request_id=self._request_id,
+                    num_tokens=num_tokens,
+                    current_state=self._get_current_state_id(),
+                )
+            except Exception:
+                pass
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
-        # 原逻辑
+        current_state = self._get_current_state_id()
         llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)
         self.check_error()
 
-        # ✅ 修改7：使用统一方法（保留self._request_id检查）
         if self._is_audit_enabled() and self._request_id:
-            self._audit_tracker.record_bitmask_update(
-                request_id=self._request_id,
-                bitmask=bitmask[idx],
-                current_state=f"stopped={self.ll_matcher.is_stopped()};tokens={self.num_processed_tokens};terminated={self.terminated}",
-            )
+            try:
+                self._audit_tracker.record_bitmask_update(
+                    request_id=self._request_id,
+                    bitmask=bitmask[idx],
+                    current_state=current_state,
+                )
+            except Exception:
+                pass
 
     def is_terminated(self) -> bool:
         return self.terminated
 
     def reset(self):
-        # 原注释：This method may be called multiple times per request
         self.printed_error = False
         self.terminated = False
         self.num_processed_tokens = 0
         self._termination_logged = False
+        self.ll_matcher.reset()
+
+        if self._audit_tracker and self._request_id:
+            try:
+                self._audit_tracker.cleanup_trail(self._request_id)
+            except Exception:
+                pass
+            self._request_id = None
 
 
 def serialize_guidance_grammar(
-    request_type: StructuredOutputOptions,
-    grammar_spec: Union[str, dict[str, Any]],
-    disable_any_whitespace: bool = False,
-    disable_additional_properties: bool = False,
+        request_type: StructuredOutputOptions,
+        grammar_spec: Union[str, dict[str, Any]],
+        disable_any_whitespace: bool = False,
+        disable_additional_properties: bool = False,
 ) -> str:
-
     def _process_schema(grammar_spec: Union[str, dict[str, Any]], ) -> str:
         if disable_additional_properties:
             grammar_spec = process_for_additional_properties(grammar_spec)

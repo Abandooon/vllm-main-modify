@@ -6,17 +6,13 @@ from __future__ import annotations
 import enum
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Any
 
 if TYPE_CHECKING:
     import torch
 
     from vllm.config import VllmConfig
     from vllm.transformers_utils.tokenizer import AnyTokenizer
-    # Import audit tracker for type hints
-    from vllm.v1.structured_output.audit_tracker import (
-        StructuredOutputAuditTracker, AuditEventType
-    )
 
 
 class StructuredOutputOptions(enum.Enum):
@@ -31,32 +27,18 @@ class StructuredOutputOptions(enum.Enum):
 StructuredOutputKey = tuple[StructuredOutputOptions, str]
 
 
-# backend_types.py - 改进的基类
 class StructuredOutputGrammar(ABC):
+    """Request-level backend for structured output requests."""
+
     def __init__(self):
-        self._audit_tracker: Optional[StructuredOutputAuditTracker] = None
+        """Initialize audit tracking support."""
+        self._audit_tracker: Optional[Any] = None
         self._request_id: Optional[str] = None
         self._backend_name: str = self.__class__.__name__
-        self._previously_logged_termination: bool = False
-
-    # 改用factory method而不是直接在__init__中初始化
-    @classmethod
-    def create_with_audit(cls, *args, **kwargs):
-        """Factory method for creating grammar with audit support"""
-        instance = cls(*args, **kwargs)
-        instance._init_audit()  # 延迟调用审计初始化
-        return instance
-
-    def _init_audit(self):
-        try:
-            from vllm.v1.structured_output.audit_tracker import get_audit_tracker
-            self._audit_tracker = get_audit_tracker()
-        except ImportError:
-            pass
 
     def set_audit_context(self,
                           request_id: str,
-                          audit_tracker: Optional[StructuredOutputAuditTracker] = None) -> None:
+                          audit_tracker: Optional[Any] = None) -> None:
         """
         Set audit context for this grammar instance.
 
@@ -77,26 +59,21 @@ class StructuredOutputGrammar(ABC):
 
         # Start audit trail if tracker is enabled
         if self._audit_tracker and self._audit_tracker.is_enabled():
-            self._audit_tracker.start_trail(
-                request_id=request_id,
-                backend_type=self._backend_name
-            )
+            try:
+                self._audit_tracker.start_trail(
+                    request_id=request_id,
+                    backend_type=self._backend_name
+                )
+            except Exception:
+                pass
 
-    def _audit_record(self, event_type: str, **kwargs) -> None:
-        """Internal method to record audit events."""
-        if not (self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id):
-            return
-        try:
-            from vllm.v1.structured_output.audit_tracker import AuditEventType
-            event_type_enum = AuditEventType(event_type)
-            self._audit_tracker.record_event(
-                request_id=self._request_id,
-                event_type=event_type_enum,
-                **kwargs
-            )
-        except Exception:
-            # 审计失败不影响主流程
-            pass
+    def finalize_audit(self) -> None:
+        """Finalize the audit trail for this grammar."""
+        if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
+            try:
+                self._audit_tracker.finalize_trail(self._request_id)
+            except Exception:
+                pass
 
     @abstractmethod
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
@@ -161,11 +138,6 @@ class StructuredOutputGrammar(ABC):
         Resets the state of the structured output grammar.
         """
 
-    def finalize_audit(self) -> None:
-        """Finalize the audit trail for this grammar."""
-        if self._audit_tracker and self._audit_tracker.is_enabled() and self._request_id:
-            self._audit_tracker.finalize_trail(self._request_id)
-
 
 @dataclass
 class StructuredOutputBackend(ABC):
@@ -177,7 +149,7 @@ class StructuredOutputBackend(ABC):
 
     def __post_init__(self):
         """Initialize the backend with optional audit support."""
-        self._audit_tracker: Optional[StructuredOutputAuditTracker] = None
+        self._audit_tracker: Optional[Any] = None
         try:
             from vllm.v1.structured_output.audit_tracker import get_audit_tracker
             self._audit_tracker = get_audit_tracker()
