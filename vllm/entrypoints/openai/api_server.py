@@ -1517,6 +1517,12 @@ def build_app(args: Namespace) -> FastAPI:
     else:
         app = FastAPI(lifespan=lifespan)
     app.include_router(router)
+    try:
+        from vllm.v1.structured_output.audit_admin_api import register_audit_routes  # audit-admin
+        register_audit_routes(app)
+    except Exception as e:
+        logger.warning("Audit admin API not mounted: %s", e)
+
     app.root_path = args.root_path
 
     mount_metrics(app)
