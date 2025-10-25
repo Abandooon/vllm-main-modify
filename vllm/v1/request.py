@@ -142,8 +142,9 @@ class Request:
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
             structured_output_request=StructuredOutputRequest(
-                sampling_params=request.sampling_params) \
-                    if request.sampling_params else None,
+                sampling_params=request.sampling_params,
+                request_id=request.request_id,
+            ) if request.sampling_params else None,
             cache_salt=request.cache_salt,
             priority=request.priority,
             trace_headers=request.trace_headers,

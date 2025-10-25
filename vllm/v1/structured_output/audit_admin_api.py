@@ -7,6 +7,11 @@ This module provides HTTP endpoints for querying and managing audit trails.
 
 import json
 import time
+
+import os
+import glob
+from collections import defaultdict
+
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dataclasses import asdict
@@ -92,23 +97,143 @@ class AuditExportResponse(BaseModel):
 
 router = APIRouter(prefix="/v1/admin/audit", tags=["audit"])
 
+def _load_persisted_trails() -> Dict[str, Dict[str, Any]]:
+    """
+    从 /audit-logs/*.ndjson 重建跨进程的 trail 视图。
+    返回: { request_id: { "backend_type":..., "start_time":..., "end_time":..., "events":[...], "stats":{...} } }
+    """
+    trails: Dict[str, Dict[str, Any]] = {}
+    log_dir = os.environ.get("VLLM_AUDIT_LOG_DIR")
+    persist_enabled = os.environ.get("VLLM_AUDIT_PERSIST", "false").lower() == "true"
+
+    if not (persist_enabled and log_dir and os.path.isdir(log_dir)):
+        return trails  # 没挂卷/没开启持久化，就直接返回空
+
+    # 我们默认只有一个 audit.ndjson，但也支持多文件（以后可能按时间/进程切分）
+    pattern_list = [
+        os.path.join(log_dir, "audit.ndjson"),
+        os.path.join(log_dir, "audit_*.ndjson"),
+    ]
+
+    for pattern in pattern_list:
+        for fname in glob.glob(pattern):
+            try:
+                with open(fname, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+
+                        rid = rec.get("request_id")
+                        if not rid:
+                            continue
+
+                        # 确保初始化
+                        t = trails.setdefault(rid, {
+                            "backend_type": None,
+                            "start_time": None,
+                            "end_time": None,
+                            "grammar_spec": None,
+                            "events": [],
+                            "tot_tokens": 0,
+                            "rollbacks": 0,
+                            "errors": 0,
+                        })
+
+                        rtype = rec.get("record_type")
+
+                        if rtype == "start_trail":
+                            t["backend_type"] = rec.get("backend_type", t["backend_type"])
+                            t["start_time"] = rec.get("start_time", t["start_time"])
+                            # 短的 grammar_spec 才记录
+                            if rec.get("grammar_spec"):
+                                t["grammar_spec"] = rec["grammar_spec"]
+
+                        elif rtype == "event":
+                            ev = rec.get("event", {})
+                            t["events"].append(ev)
+
+                            # 统计信息
+                            etype = ev.get("event_type")
+                            if etype == "token_accept":
+                                acc = ev.get("accepted_tokens") or []
+                                t["tot_tokens"] += len(acc)
+                            elif etype == "rollback":
+                                t["rollbacks"] += 1
+                            elif etype == "error":
+                                t["errors"] += 1
+
+                        elif rtype == "finalize":
+                            summary = rec.get("summary", {})
+                            # 尝试从 summary 里拉更多聚合字段
+                            t["end_time"] = summary.get("end_time", t["end_time"])
+                            # 如果 summary 里已经有统计，就覆盖本地的
+                            if "total_tokens_generated" in summary:
+                                t["tot_tokens"] = summary["total_tokens_generated"]
+                            if "total_rollbacks" in summary:
+                                t["rollbacks"] = summary["total_rollbacks"]
+                            if "total_errors" in summary:
+                                t["errors"] = summary["total_errors"]
+
+            except Exception as e:
+                logger.warning(f"[AuditPersistRead] Failed reading {fname}: {e}")
+
+    return trails
+
+
+def _merge_memory_and_disk(tracker):
+    """
+    返回 { request_id: merged_trail_obj }
+    merged_trail_obj 的结构跟 _load_persisted_trails() 里的一样 + 补齐内存统计
+    """
+    disk_trails = _load_persisted_trails()
+
+    # 合并内存里的 trails（APIServer 自己 pid=1 的 _global_audit_tracker）
+    if tracker and tracker.is_enabled():
+        mem_trails = tracker.get_all_trails()
+        for rid, trail in mem_trails.items():
+            mt = disk_trails.setdefault(rid, {
+                "backend_type": trail.backend_type,
+                "start_time": trail.start_time,
+                "end_time": trail.end_time,
+                "grammar_spec": trail.grammar_spec,
+                "events": [],
+                "tot_tokens": 0,
+                "rollbacks": 0,
+                "errors": 0,
+            })
+
+            # 覆盖基础元信息（内存一般更全）
+            mt["backend_type"] = trail.backend_type or mt["backend_type"]
+            mt["start_time"] = trail.start_time or mt["start_time"]
+            mt["end_time"] = trail.end_time or mt["end_time"]
+            if trail.grammar_spec and len(trail.grammar_spec) < 1000:
+                mt["grammar_spec"] = trail.grammar_spec
+
+            # 事件
+            for ev in trail.events:
+                mt["events"].append(ev.to_dict())
+
+            # 统计
+            mt["tot_tokens"] = max(mt["tot_tokens"], trail.total_tokens_generated)
+            mt["rollbacks"] = max(mt["rollbacks"], trail.total_rollbacks)
+            mt["errors"] = max(mt["errors"], trail.total_errors)
+
+    return disk_trails
 
 @router.get("/stats", response_model=AuditStatsResponse)
 async def get_audit_statistics():
-    """Get global audit system statistics."""
     tracker = get_audit_tracker()
+    merged = _merge_memory_and_disk(tracker)
 
-    if not tracker:
-        raise HTTPException(
-            status_code=503,
-            detail="Audit tracker not initialized"
-        )
-
-    all_trails = tracker.get_all_trails()
-
-    if not all_trails:
+    if not merged:
+        # 没有任何 trail
         return AuditStatsResponse(
-            enabled=tracker.is_enabled(),
+            enabled=bool(tracker and tracker.is_enabled()),
             total_trails=0,
             active_trails=0,
             total_events_recorded=0,
@@ -117,117 +242,124 @@ async def get_audit_statistics():
             memory_usage_trails=0
         )
 
-    total_events = sum(len(trail.events) for trail in all_trails.values())
-    active_count = sum(1 for trail in all_trails.values() if trail.end_time is None)
+    # 计算统计
+    total_trails = len(merged)
+    total_events_recorded = 0
+    active_trails = 0
+    durations = []
+    steps_per_trail = []
 
-    finalized_trails = [t for t in all_trails.values() if t.end_time is not None]
-    avg_steps = (
-        sum(t.total_steps for t in all_trails.values()) / len(all_trails)
-        if all_trails else 0.0
-    )
-    avg_duration = (
-        sum(t.end_time - t.start_time for t in finalized_trails) / len(finalized_trails)
-        if finalized_trails else 0.0
-    )
+    for rid, t in merged.items():
+        evs = t.get("events", [])
+        total_events_recorded += len(evs)
+
+        start_time = t.get("start_time")
+        end_time = t.get("end_time")
+        if end_time is None:
+            active_trails += 1
+        else:
+            durations.append(end_time - start_time if start_time else 0)
+
+        steps_per_trail.append(len(evs))
+
+    avg_steps = (sum(steps_per_trail) / len(steps_per_trail)) if steps_per_trail else 0.0
+    avg_duration = (sum(durations) / len(durations)) if durations else 0.0
 
     return AuditStatsResponse(
-        enabled=tracker.is_enabled(),
-        total_trails=len(all_trails),
-        active_trails=active_count,
-        total_events_recorded=total_events,
+        enabled=bool(tracker and tracker.is_enabled()),
+        total_trails=total_trails,
+        active_trails=active_trails,
+        total_events_recorded=total_events_recorded,
         avg_steps_per_trail=avg_steps,
         avg_duration_seconds=avg_duration,
-        memory_usage_trails=len(all_trails)
+        memory_usage_trails=len(merged)
     )
+
 
 from typing import Annotated
 @router.get("/list", response_model=List[AuditTrailSummary])
 async def list_audit_trails(
-        limit: Annotated[int, Query(ge=1, le=1000, description="Maximum trails to return")] = 100,
-        offset: Annotated[int, Query(ge=0, description="Number of trails to skip")] = 0,
-        backend_type: Annotated[Optional[str], Query(description="Filter by backend type")] = None,
-        include_active: Annotated[bool, Query(description="Include active (not finalized) trails")] = True
+    limit: Annotated[int, Query(ge=1, le=1000, description="Maximum trails to return")] = 100,
+    offset: Annotated[int, Query(ge=0, description="Number of trails to skip")] = 0,
+    backend_type: Annotated[Optional[str], Query(description="Filter by backend type")] = None,
+    include_active: Annotated[bool, Query(description="Include active (not finalized) trails")] = True
 ):
-    """List audit trails with optional filtering."""
     tracker = get_audit_tracker()
+    merged = _merge_memory_and_disk(tracker)
 
-    if not tracker:
-        raise HTTPException(
-            status_code=503,
-            detail="Audit tracker not initialized"
-        )
-
-    all_trails = tracker.get_all_trails()
-
-    # Filter trails
-    filtered_trails = []
-    for trail in all_trails.values():
-        if backend_type and trail.backend_type != backend_type:
+    # 过滤
+    filtered = []
+    for rid, t in merged.items():
+        if backend_type and t.get("backend_type") != backend_type:
             continue
-        if not include_active and trail.end_time is None:
+        if not include_active and t.get("end_time") is None:
             continue
-        filtered_trails.append(trail)
+        filtered.append((rid, t))
 
-    # Sort by start_time (newest first)
-    filtered_trails.sort(key=lambda t: t.start_time, reverse=True)
+    # 按 start_time 倒序
+    filtered.sort(key=lambda pair: pair[1].get("start_time", 0.0), reverse=True)
 
-    # Apply pagination
-    paginated_trails = filtered_trails[offset:offset + limit]
+    # 分页
+    page = filtered[offset:offset + limit]
 
-    # Convert to response model
-    return [
-        AuditTrailSummary(
-            request_id=trail.request_id,
-            backend_type=trail.backend_type,
-            start_time=trail.start_time,
-            end_time=trail.end_time,
-            duration=trail.end_time - trail.start_time if trail.end_time else None,
-            total_steps=trail.total_steps,
-            total_tokens_generated=trail.total_tokens_generated,
-            total_rollbacks=trail.total_rollbacks,
-            total_errors=trail.total_errors
-        )
-        for trail in paginated_trails
-    ]
+    # 组装响应
+    result = []
+    for rid, t in page:
+        st = t.get("start_time")
+        et = t.get("end_time")
+        duration = (et - st) if (st is not None and et is not None) else None
+
+        result.append(AuditTrailSummary(
+            request_id=rid,
+            backend_type=t.get("backend_type"),
+            start_time=st,
+            end_time=et,
+            duration=duration,
+            total_steps=len(t.get("events", [])),
+            total_tokens_generated=t.get("tot_tokens", 0),
+            total_rollbacks=t.get("rollbacks", 0),
+            total_errors=t.get("errors", 0)
+        ))
+
+    return result
+
 
 
 @router.get("/trail/{request_id}", response_model=AuditTrailDetail)
 async def get_audit_trail(
-        request_id: str,
-        include_events: Annotated[bool, Query(description="Include full event data")] = True
+    request_id: str,
+    include_events: Annotated[bool, Query(description="Include full event data")] = True
 ):
-    """Get detailed information for a specific audit trail."""
     tracker = get_audit_tracker()
+    merged = _merge_memory_and_disk(tracker)
 
-    if not tracker:
-        raise HTTPException(
-            status_code=503,
-            detail="Audit tracker not initialized"
-        )
-
-    trail = tracker.get_trail(request_id)
-
-    if not trail:
+    if request_id not in merged:
         raise HTTPException(
             status_code=404,
             detail=f"Audit trail not found for request_id: {request_id}"
         )
 
-    trail_dict = trail.to_dict(include_events=include_events)
+    t = merged[request_id]
+    st = t.get("start_time")
+    et = t.get("end_time")
+    duration = (et - st) if (st is not None and et is not None) else None
+
+    events = t.get("events", []) if include_events else []
 
     return AuditTrailDetail(
-        request_id=trail_dict["request_id"],
-        backend_type=trail_dict["backend_type"],
-        grammar_spec=trail_dict.get("grammar_spec"),
-        start_time=trail_dict["start_time"],
-        end_time=trail_dict.get("end_time"),
-        duration=trail_dict.get("duration"),
-        total_steps=trail_dict["total_steps"],
-        total_tokens_generated=trail_dict["total_tokens_generated"],
-        total_rollbacks=trail_dict["total_rollbacks"],
-        total_errors=trail_dict["total_errors"],
-        events=trail_dict.get("events", [])
+        request_id=request_id,
+        backend_type=t.get("backend_type"),
+        grammar_spec=t.get("grammar_spec"),
+        start_time=st,
+        end_time=et,
+        duration=duration,
+        total_steps=len(t.get("events", [])),
+        total_tokens_generated=t.get("tot_tokens", 0),
+        total_rollbacks=t.get("rollbacks", 0),
+        total_errors=t.get("errors", 0),
+        events=events
     )
+
 
 
 @router.post("/export", response_model=AuditExportResponse)

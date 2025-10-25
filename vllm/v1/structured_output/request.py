@@ -19,13 +19,13 @@ from vllm.v1.structured_output.backend_types import (StructuredOutputGrammar,
 class StructuredOutputRequest:
 
     sampling_params: SamplingParams
-    request_id: str
+    request_id: Optional[str] = None
     _grammar: Optional[Union[Future[StructuredOutputGrammar],
                              StructuredOutputGrammar]] = None
 
     def _bind_grammar_to_request(self):
         """在grammar准备好后，绑定request_id"""
-        if isinstance(self._grammar, StructuredOutputGrammar):
+        if isinstance(self._grammar, StructuredOutputGrammar) and self.request_id:
             self._grammar.set_audit_context(self.request_id)
 
     reasoning_ended: Optional[bool] = None

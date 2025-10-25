@@ -19,6 +19,9 @@ from collections import defaultdict
 import threading
 import numpy as np
 import torch
+import os
+import socket  # 可选：记录主机名
+
 
 from vllm.logger import init_logger
 
@@ -160,38 +163,67 @@ class AuditTrail:
 
 
 class StructuredOutputAuditTracker:
-    """
-    Centralized audit tracker for structured output generation.
-
-    This class manages audit trails for multiple concurrent requests and provides
-    thread-safe operations for recording audit events.
-    """
-
     def __init__(self,
                  enabled: bool = False,
                  max_trails: int = 1000,
                  record_allowed_tokens: bool = False,
-                 record_full_events: bool = True):
-        """
-        Initialize the audit tracker.
-
-        Args:
-            enabled: Whether audit tracking is enabled
-            max_trails: Maximum number of audit trails to keep in memory
-            record_allowed_tokens: Whether to record full allowed token sets
-            record_full_events: Whether to record all events or just summaries
-        """
+                 record_full_events: bool = True,
+                 persist_to_disk: bool = False,
+                 log_dir: Optional[str] = None):
         self.enabled = enabled
         self.max_trails = max_trails
         self.record_allowed_tokens = record_allowed_tokens
         self.record_full_events = record_full_events
 
+        # 新增：持久化配置
+        self.persist_to_disk = persist_to_disk
+        self.log_dir = log_dir
+        self.pid = os.getpid()
+        self.hostname = socket.gethostname() if hasattr(socket, "gethostname") else "unknown-host"
+
         self._trails: Dict[str, AuditTrail] = {}
         self._lock = threading.Lock()
         self._step_counters: Dict[str, int] = defaultdict(int)
 
+        # 预先组好日志文件路径（所有 EngineCore 进程 + APIServer 进程都会往同一卷 append）
+        self._ndjson_path = None
+        if self.persist_to_disk and self.log_dir:
+            try:
+                os.makedirs(self.log_dir, exist_ok=True)
+                self._ndjson_path = os.path.join(self.log_dir, "audit.ndjson")
+            except Exception as e:
+                logger.warning(f"[AuditPersist] Failed to init log dir {self.log_dir}: {e}")
+                self._ndjson_path = None
+
         if self.enabled:
-            logger.info("Structured output audit tracking enabled")
+            logger.info("Structured output audit tracking enabled (persist_to_disk=%s log_dir=%s pid=%s)",
+                        self.persist_to_disk, self.log_dir, self.pid)
+
+
+    def _persist_line(self, record_type: str, payload: Dict[str, Any]) -> None:
+        """
+        以 NDJSON 形式把一条审计记录落盘，用于跨进程共享。
+
+        record_type: "start_trail" | "event" | "finalize"
+        payload: 会至少包含 request_id, 其它字段任意
+        """
+        if not (self.persist_to_disk and self._ndjson_path):
+            return
+
+        try:
+            line = {
+                "ts": time.time(),
+                "pid": self.pid,
+                "host": self.hostname,
+                "record_type": record_type,
+                **payload,
+            }
+            with open(self._ndjson_path, "a") as f:
+                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"[AuditPersist] Failed writing audit line: {e}")
+
+
 
     def is_enabled(self) -> bool:
         """Check if audit tracking is enabled."""
@@ -209,17 +241,19 @@ class StructuredOutputAuditTracker:
                     request_id: str,
                     backend_type: str,
                     grammar_spec: Optional[str] = None) -> None:
-        """Start a new audit trail for a request."""
         if not self.enabled:
+            logger.warning(
+                f"[Audit] start_trail() skipped: tracker.enabled={self.enabled} "
+                f"request_id={request_id}"
+            )
             return
 
         with self._lock:
-            # 如果trail已存在，则不覆盖
             if request_id in self._trails:
-                logger.debug(f"Trail for {request_id} already exists, skipping restart")
+                logger.debug(f"[Audit] Trail for {request_id} already exists, skipping restart")
                 return
 
-            # 检查容量上限
+            # 容量控制...
             if len(self._trails) >= self.max_trails:
                 oldest_id = min(self._trails.keys(),
                                 key=lambda k: self._trails[k].start_time)
@@ -234,18 +268,26 @@ class StructuredOutputAuditTracker:
             )
             self._step_counters[request_id] = 0
 
+            logger.warning(
+                f"[Audit] start_trail(): CREATED trail for {request_id} "
+                f"backend={backend_type} tracker_id={id(self)} pid={self.pid}"
+            )
+
+            # 🌟新增：把起始信息落盘
+            self._persist_line(
+                "start_trail",
+                {
+                    "request_id": request_id,
+                    "backend_type": backend_type,
+                    "start_time": self._trails[request_id].start_time,
+                    "grammar_spec": grammar_spec if grammar_spec and len(grammar_spec) < 1000 else None,
+                },
+            )
+
     def record_event(self,
                      request_id: str,
                      event_type: AuditEventType,
                      **kwargs) -> None:
-        """
-        Record an audit event.
-
-        Args:
-            request_id: The request ID
-            event_type: Type of the event
-            **kwargs: Additional event data
-        """
         if not self.enabled or not self.record_full_events:
             return
 
@@ -265,6 +307,18 @@ class StructuredOutputAuditTracker:
             )
 
             self._trails[request_id].add_event(event)
+
+            # 🌟新增：把事件落盘
+            try:
+                self._persist_line(
+                    "event",
+                    {
+                        "request_id": request_id,
+                        "event": event.to_dict(),
+                    },
+                )
+            except Exception as e:
+                logger.warning(f"[AuditPersist] Failed to persist event for {request_id}: {e}")
 
     def record_token_acceptance(self,
                                 request_id: str,
@@ -332,13 +386,26 @@ class StructuredOutputAuditTracker:
         )
 
     def finalize_trail(self, request_id: str) -> None:
-        """Finalize the audit trail for a request."""
+        """Finalize the audit trail for a request and persist summary (includes end_time)."""
         if not self.enabled:
             return
 
         with self._lock:
-            if request_id in self._trails:
-                self._trails[request_id].finalize()
+            trail = self._trails.get(request_id)
+            if trail is None:
+                return
+
+            # 1. 内存里写上 end_time
+            trail.finalize()  # 这里会把 trail.end_time = time.time()，也能计算 duration 等
+
+            # 2. 把最终状态（不含所有 events，避免爆炸）落盘
+            self._persist_line(
+                "finalize",
+                {
+                    "request_id": request_id,
+                    "summary": trail.to_dict(include_events=False),
+                },
+            )
 
     def get_trail(self, request_id: str) -> Optional[AuditTrail]:
         """Get the audit trail for a request."""
@@ -375,18 +442,42 @@ class StructuredOutputAuditTracker:
 _global_audit_tracker = None
 
 
+# audit_tracker.py
 def get_audit_tracker() -> StructuredOutputAuditTracker:
-    """Get the global audit tracker instance."""
     global _global_audit_tracker
     if _global_audit_tracker is None:
         import os
-        enabled = os.environ.get("VLLM_STRUCTURED_OUTPUT_AUDIT", "false").lower() == "true"
-        record_allowed_tokens = os.environ.get("VLLM_AUDIT_RECORD_ALLOWED_TOKENS", "false").lower() == "true"
+        enabled_raw = os.environ.get("VLLM_STRUCTURED_OUTPUT_AUDIT", "false")
+        record_allowed_raw = os.environ.get("VLLM_AUDIT_RECORD_ALLOWED_TOKENS", "false")
+        persist_raw = os.environ.get("VLLM_AUDIT_PERSIST", "false")
+        log_dir = os.environ.get("VLLM_AUDIT_LOG_DIR")
+
+        logger.warning(
+            f"[AuditInit] get_audit_tracker(): "
+            f"VLLM_STRUCTURED_OUTPUT_AUDIT={enabled_raw} "
+            f"VLLM_AUDIT_RECORD_ALLOWED_TOKENS={record_allowed_raw} "
+            f"VLLM_AUDIT_PERSIST={persist_raw} "
+            f"VLLM_AUDIT_LOG_DIR={log_dir}"
+        )
+
+        enabled = enabled_raw.lower() == "true"
+        record_allowed_tokens = record_allowed_raw.lower() == "true"
+        persist_to_disk = persist_raw.lower() == "true"
+
         _global_audit_tracker = StructuredOutputAuditTracker(
             enabled=enabled,
-            record_allowed_tokens=record_allowed_tokens
+            record_allowed_tokens=record_allowed_tokens,
+            persist_to_disk=persist_to_disk,
+            log_dir=log_dir,
+        )
+        logger.warning(
+            f"[AuditInit] tracker created: enabled={_global_audit_tracker.enabled} "
+            f"id={id(_global_audit_tracker)} persist_to_disk={_global_audit_tracker.persist_to_disk} "
+            f"log_dir={_global_audit_tracker.log_dir}"
         )
     return _global_audit_tracker
+
+
 
 
 def configure_audit_tracker(enabled: bool = False,

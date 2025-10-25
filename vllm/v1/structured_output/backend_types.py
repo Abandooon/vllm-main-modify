@@ -62,7 +62,8 @@ class StructuredOutputGrammar(ABC):
             try:
                 self._audit_tracker.start_trail(
                     request_id=request_id,
-                    backend_type=self._backend_name
+                    backend_type=self._backend_name,
+                    grammar_spec=None
                 )
             except Exception:
                 pass

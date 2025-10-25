@@ -135,14 +135,36 @@ class GuidanceGrammar(StructuredOutputGrammar):
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the parser."""
-        # 延迟绑定审计上下文（首次进来时绑定）
+        # ✅ 关键修改：首次绑定时，显式启动审计 trail
         if self._request_id is None:
             self._request_id = request_id
+
             if self._is_audit_enabled():
                 try:
-                    self.set_audit_context(request_id)
-                except Exception:
-                    pass
+                    self._audit_tracker.start_trail(
+                        request_id=request_id,
+                        backend_type=self._backend_name,
+                        grammar_spec=None,
+                    )
+
+                    # 原本是 logger.debug(...)
+                    logger.warning(
+                        f"[AuditGrammarInit] backend={self._backend_name} "
+                        f"request_id={request_id} "
+                        f"tracker_enabled={self._audit_tracker.is_enabled()} "
+                        f"tracker_id={id(self._audit_tracker)}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[AuditGrammarInit] FAILED to start trail for {request_id}: {e}"
+                    )
+            else:
+                logger.warning(
+                    f"[AuditGrammarInit] audit not enabled for backend={self._backend_name} "
+                    f"request_id={request_id} "
+                    f"tracker={self._audit_tracker} "
+                    f"tracker_enabled={getattr(self._audit_tracker, 'enabled', None)}"
+                )
 
         if self.ll_tokenizer.eos_token in tokens:
             self.terminated = True
